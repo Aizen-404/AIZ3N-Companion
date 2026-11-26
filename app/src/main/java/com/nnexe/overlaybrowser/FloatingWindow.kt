@@ -15,7 +15,10 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.text.SpannableStringBuilder
 import android.text.TextUtils
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
@@ -62,12 +65,16 @@ class FloatingWindow(
     private val minWidth = dp(240)
     private val minHeight = dp(160)
     private val touchSlop = ViewConfiguration.get(ctx).scaledTouchSlop
-    private val statusBarHeight = ctx.resources.getIdentifier("status_bar_height", "dimen", "android")
-        .let { if (it != 0) ctx.resources.getDimensionPixelSize(it) else 0 }
+    private val statusBarHeight = ctx.resources.getIdentifier(
+        "status_bar_height", "dimen", "android"
+    ).let { if (it != 0) ctx.resources.getDimensionPixelSize(it) else 0 }
+
     private val main = Handler(Looper.getMainLooper())
     private val imm = ctx.getSystemService(InputMethodManager::class.java)
 
-    private val root = LayoutInflater.from(ctx).inflate(R.layout.overlay_window, null) as OverlayRootView
+    private val root = LayoutInflater.from(ctx)
+        .inflate(R.layout.overlay_window, null) as OverlayRootView
+
     private val toolbar: View = root.findViewById(R.id.toolbar)
     private val dragHandle: ImageView = root.findViewById(R.id.drag_handle)
     private val btnBack: ImageButton = root.findViewById(R.id.btn_back)
@@ -114,7 +121,9 @@ class FloatingWindow(
     private lateinit var cmdInput: EditText
     private lateinit var btnSend: TextView
 
-    private val logLines = ArrayDeque<String>()
+    private data class LogEntry(val text: String, val type: Int)
+
+    private val logLines = ArrayDeque<LogEntry>()
     private val commandHistory = mutableListOf<String>()
     private var historyIndex = -1
 
@@ -122,23 +131,20 @@ class FloatingWindow(
         host = prefs.host,
         port = prefs.port,
         onLine = { line ->
-            main.post {
-                if (line.isNotBlank()) appendLine(line)
-            }
+            main.post { appendAgentLine(line) }
         },
         onStatus = { connected, status ->
             main.post {
                 if (status.startsWith("Connecting", true)) {
-                    statusField.setText("WAITING FOR GAME")
-                    statusField.setTextColor(Color.parseColor("#F0B35A"))
+                    setConnectionStatus(false)
                 } else if (connected) {
-                    statusField.setText("● CONNECTED")
-                    statusField.setTextColor(Color.parseColor("#55D6A2"))
+                    setConnectionStatus(true)
 
                     if (lastConnectionState != true) {
                         appendLine(
                             if (hasConnectedBefore) "Connection restored."
-                            else "AIZ3N agent connected."
+                            else "AIZ3N agent connected.",
+                            TYPE_SUCCESS
                         )
                     }
 
@@ -150,8 +156,7 @@ class FloatingWindow(
                     pendingInitialCommand = null
                     if (!pending.isNullOrBlank()) sendCommand(pending)
                 } else if (status != "Stopped") {
-                    statusField.setText("WAITING FOR GAME")
-                    statusField.setTextColor(Color.parseColor("#F0B35A"))
+                    setConnectionStatus(false)
 
                     if (lastConnectionState != false) {
                         appendLine(
@@ -159,7 +164,8 @@ class FloatingWindow(
                                 "Connection lost. Waiting for the game..."
                             } else {
                                 "Game not detected. Launch the game with AIZ3N enabled. Waiting for connection..."
-                            }
+                            },
+                            TYPE_WARNING
                         )
                     }
 
@@ -195,7 +201,8 @@ class FloatingWindow(
         if (Build.VERSION.SDK_INT >= 29) {
             for (handle in listOf(dragHandle, resizeLeft, resizeRight)) {
                 handle.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
-                    v.systemGestureExclusionRects = listOf(Rect(0, 0, v.width, v.height))
+                    v.systemGestureExclusionRects =
+                        listOf(Rect(0, 0, v.width, v.height))
                 }
             }
         }
@@ -227,17 +234,26 @@ class FloatingWindow(
 
         val container = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0B1018"))
+            setBackgroundColor(C_BG)
         }
 
         logText = TextView(ctx).apply {
             typeface = Typeface.create("monospace", Typeface.NORMAL)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(Color.parseColor("#D7E0EA"))
+            setTextColor(C_TEXT)
             setTextIsSelectable(true)
             setPadding(dp(12), dp(10), dp(12), dp(10))
-            setLineSpacing(dp(2).toFloat(), 1f)
-            setText("AIZ3N TERMINAL\n\nWaiting for agent connection...")
+            setLineSpacing(dp(3).toFloat(), 1f)
+            text = SpannableStringBuilder().apply {
+                appendStyled("AIZ3N CORE", C_PURPLE, true)
+                append("\n")
+                appendStyled("Secure agent console initialized.", C_MUTED)
+                append("\n\n")
+                appendStyled(
+                    "Waiting for agent connection...",
+                    C_AMBER
+                )
+            }
         }
 
         logScroll = ScrollView(ctx).apply {
@@ -254,35 +270,38 @@ class FloatingWindow(
         }
 
         val divider = View(ctx).apply {
-            setBackgroundColor(Color.parseColor("#263343"))
+            setBackgroundColor(C_DIVIDER)
         }
 
         val inputBar = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#111925"))
+            setBackgroundColor(C_INPUT_BG)
             setPadding(dp(9), dp(7), dp(9), dp(7))
         }
 
         val prompt = TextView(ctx).apply {
-            text = "AIZ3N"
             typeface = Typeface.create("monospace", Typeface.BOLD)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextColor(Color.parseColor("#65B8FF"))
-            setPadding(dp(3), 0, dp(9), 0)
+            setPadding(dp(3), 0, dp(8), 0)
+            text = SpannableStringBuilder().apply {
+                appendStyled("[ AIZ3N CORE ] ", C_PURPLE, true)
+                appendStyled("::", C_AMBER, true)
+                appendStyled(" _", Color.WHITE, true)
+            }
         }
 
         cmdInput = EditText(ctx).apply {
             hint = "Enter command..."
-            setHintTextColor(Color.parseColor("#69798C"))
-            setTextColor(Color.parseColor("#F0F4F8"))
+            setHintTextColor(C_MUTED)
+            setTextColor(Color.WHITE)
             typeface = Typeface.MONOSPACE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             background = null
             setSingleLine(true)
-            imeOptions = EditorInfo.IME_ACTION_SEND or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            imeOptions = EditorInfo.IME_ACTION_SEND or
+                EditorInfo.IME_FLAG_NO_EXTRACT_UI
             setPadding(dp(3), dp(7), dp(5), dp(7))
-            
 
             setOnTouchListener { _, e ->
                 if (e.actionMasked == MotionEvent.ACTION_DOWN) {
@@ -331,18 +350,18 @@ class FloatingWindow(
         }
 
         btnSend = TextView(ctx).apply {
-            text = "SEND"
+            text = "EXECUTE"
             gravity = Gravity.CENTER
             typeface = Typeface.create("sans-serif", Typeface.BOLD)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(Color.WHITE)
             background = roundedBackground(
-                Color.parseColor("#176B50"),
+                C_GREEN_DARK,
                 8,
-                Color.parseColor("#269B72"),
+                C_GREEN,
                 1,
             )
-            setPadding(dp(14), dp(9), dp(14), dp(9))
+            setPadding(dp(13), dp(9), dp(13), dp(9))
             setOnClickListener { submitInput() }
         }
 
@@ -385,6 +404,82 @@ class FloatingWindow(
         )
     }
 
+    private fun SpannableStringBuilder.appendStyled(
+        value: String,
+        color: Int,
+        bold: Boolean = false,
+    ) {
+        val start = length
+        append(value)
+        setSpan(
+            ForegroundColorSpan(color),
+            start,
+            length,
+            SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        if (bold) {
+            setSpan(
+                StyleSpan(Typeface.BOLD),
+                start,
+                length,
+                SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+    }
+
+    private fun setConnectionStatus(connected: Boolean) {
+        statusField.setText(
+            if (connected) "● CORE CONNECTED" else "WAITING FOR GAME"
+        )
+        statusField.setTextColor(
+            if (connected) C_GREEN else C_AMBER
+        )
+    }
+
+    private fun appendAgentLine(raw: String) {
+        var line = raw.trim()
+        if (line.isEmpty()) return
+
+        // Hide native protocol prompts and response wrappers.
+        val prefixes = listOf("[AIZ3N]==>", "[Response]==>")
+        var changed: Boolean
+
+        do {
+            changed = false
+            for (prefix in prefixes) {
+                if (line.startsWith(prefix, true)) {
+                    line = line.removePrefix(prefix).trim()
+                    changed = true
+                }
+            }
+        } while (changed)
+
+        if (line.isBlank()) return
+
+        // Hide internal initialization noise and decorative banners.
+        if (line.equals("GumJS: Ready", true)) return
+        if (line.equals("AIZ3N TERMINAL", true)) return
+        if (line.all { it == '=' } || line.all { it == '-' }) return
+
+        if (line.startsWith("[Error]", true) ||
+            line.startsWith("Error:", true)
+        ) {
+            appendLine(line, TYPE_ERROR)
+        } else if (
+            line.startsWith("PID:", true) ||
+            line.startsWith("PWD:", true)
+        ) {
+            appendLine(line, TYPE_INFO)
+        } else if (
+            line.startsWith("AIZ3N agent connected", true) ||
+            line.startsWith("Connected", true)
+        ) {
+            // The connection callback already displays this event.
+        } else {
+            appendLine(line, TYPE_NORMAL)
+        }
+    }
+
     private fun submitInput() {
         val raw = cmdInput.text.toString().trim()
         if (raw.isEmpty()) return
@@ -404,7 +499,8 @@ class FloatingWindow(
         if (historyIndex == -1 && delta < 0) {
             historyIndex = commandHistory.size - 1
         } else {
-            historyIndex = (historyIndex + delta).coerceIn(-1, commandHistory.size - 1)
+            historyIndex = (historyIndex + delta)
+                .coerceIn(-1, commandHistory.size - 1)
         }
 
         if (historyIndex >= 0) {
@@ -415,17 +511,44 @@ class FloatingWindow(
         }
     }
 
-    private fun appendLine(text: String) {
+    private fun appendLine(text: String, type: Int = TYPE_NORMAL) {
         if (text.isBlank()) return
 
-        logLines.addLast(text)
+        logLines.addLast(LogEntry(text, type))
         while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
 
         if (!outputPaused) renderLog()
     }
 
     private fun renderLog() {
-        logText.text = logLines.joinToString("\n")
+        val output = SpannableStringBuilder()
+
+        logLines.forEach { entry ->
+            val color = when (entry.type) {
+                TYPE_SUCCESS -> C_GREEN
+                TYPE_WARNING -> C_AMBER
+                TYPE_ERROR -> C_RED
+                TYPE_INFO -> C_CYAN
+                TYPE_COMMAND -> C_PURPLE
+                else -> C_TEXT
+            }
+
+            if (entry.type == TYPE_COMMAND) {
+                output.appendStyled("[ AIZ3N CORE ] ", C_PURPLE, true)
+                output.appendStyled("::", C_AMBER, true)
+                output.appendStyled(" ${entry.text}", Color.WHITE)
+            } else {
+                output.appendStyled(
+                    entry.text,
+                    color,
+                    entry.type == TYPE_SUCCESS || entry.type == TYPE_ERROR
+                )
+            }
+
+            output.append("\n")
+        }
+
+        logText.text = output
         logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
@@ -437,7 +560,10 @@ class FloatingWindow(
     private fun copyLogToClipboard() {
         val cm = ctx.getSystemService(ClipboardManager::class.java)
         cm.setPrimaryClip(
-            ClipData.newPlainText("AIZ3N Terminal", logLines.joinToString("\n"))
+            ClipData.newPlainText(
+                "AIZ3N Console",
+                logLines.joinToString("\n") { it.text }
+            )
         )
         Toast.makeText(ctx, "Output copied", Toast.LENGTH_SHORT).show()
     }
@@ -445,7 +571,10 @@ class FloatingWindow(
     private fun showOfflineNotice() {
         if (offlineNoticeShown) return
         offlineNoticeShown = true
-        appendLine("Not connected. Launch the game with AIZ3N enabled, then reconnect.")
+        appendLine(
+            "Not connected. Launch the game with AIZ3N enabled.",
+            TYPE_WARNING
+        )
     }
 
     // Public controls
@@ -470,6 +599,7 @@ class FloatingWindow(
         }
 
         historyIndex = -1
+        appendLine(value, TYPE_COMMAND)
         client.send(value)
     }
 
@@ -662,54 +792,56 @@ class FloatingWindow(
         }
     }
 
-    private fun resizeListener(fromLeft: Boolean) = object : View.OnTouchListener {
-        private var downX = 0f
-        private var downY = 0f
-        private val start = Rect()
+    private fun resizeListener(fromLeft: Boolean) =
+        object : View.OnTouchListener {
+            private var downX = 0f
+            private var downY = 0f
+            private val start = Rect()
 
-        override fun onTouch(v: View, e: MotionEvent): Boolean {
-            if (locked || isMinimized) return false
+            override fun onTouch(v: View, e: MotionEvent): Boolean {
+                if (locked || isMinimized) return false
 
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    interacting = true
-                    downX = e.rawX
-                    downY = e.rawY
-                    start.set(bounds)
-                }
-
-                MotionEvent.ACTION_MOVE -> {
-                    val s = screen()
-                    val dx = (e.rawX - downX).roundToInt()
-                    val dy = (e.rawY - downY).roundToInt()
-                    val bottom = (start.bottom + dy).coerceIn(
-                        start.top + minHeight,
-                        s.height(),
-                    )
-
-                    if (fromLeft) {
-                        val left = (start.left + dx).coerceIn(
-                            0,
-                            start.right - minWidth,
-                        )
-                        bounds.set(left, start.top, start.right, bottom)
-                    } else {
-                        val right = (start.right + dx).coerceIn(
-                            start.left + minWidth,
-                            s.width(),
-                        )
-                        bounds.set(start.left, start.top, right, bottom)
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        interacting = true
+                        downX = e.rawX
+                        downY = e.rawY
+                        start.set(bounds)
                     }
 
-                    applyWindowLayout()
+                    MotionEvent.ACTION_MOVE -> {
+                        val s = screen()
+                        val dx = (e.rawX - downX).roundToInt()
+                        val dy = (e.rawY - downY).roundToInt()
+                        val bottom = (start.bottom + dy).coerceIn(
+                            start.top + minHeight,
+                            s.height(),
+                        )
+
+                        if (fromLeft) {
+                            val left = (start.left + dx).coerceIn(
+                                0,
+                                start.right - minWidth,
+                            )
+                            bounds.set(left, start.top, start.right, bottom)
+                        } else {
+                            val right = (start.right + dx).coerceIn(
+                                start.left + minWidth,
+                                s.width(),
+                            )
+                            bounds.set(start.left, start.top, right, bottom)
+                        }
+
+                        applyWindowLayout()
+                    }
+
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                        endInteraction()
                 }
 
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endInteraction()
+                return true
             }
-
-            return true
         }
-    }
 
     private fun endInteraction() {
         interacting = false
@@ -752,7 +884,8 @@ class FloatingWindow(
         }
 
         if (coveredBottom > 0 && bottom > s.height() - coveredBottom) {
-            bottom = (s.height() - coveredBottom).coerceAtLeast(top + minHeight)
+            bottom = (s.height() - coveredBottom)
+                .coerceAtLeast(top + minHeight)
         }
 
         if (top == bounds.top && bottom == bounds.bottom) return
@@ -926,7 +1059,7 @@ class FloatingWindow(
             typeface = Typeface.MONOSPACE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
             setText("WAITING FOR GAME")
-            setTextColor(Color.parseColor("#F0B35A"))
+            setTextColor(C_AMBER)
             setOnTouchListener(mover)
         }
 
@@ -936,7 +1069,6 @@ class FloatingWindow(
 
         btnReload.contentDescription = "Reconnect"
         btnReload.setOnClickListener {
-            appendLine("Reconnecting...")
             offlineNoticeShown = false
             client.reconnect()
         }
@@ -969,7 +1101,8 @@ class FloatingWindow(
 
     private fun updatePauseUi() {
         btnMute.setImageResource(
-            if (outputPaused) R.drawable.ic_volume_off else R.drawable.ic_volume_on
+            if (outputPaused) R.drawable.ic_volume_off
+            else R.drawable.ic_volume_on
         )
         btnMute.imageTintList = ColorStateList.valueOf(
             ctx.getColor(if (outputPaused) R.color.accent else R.color.text)
@@ -1032,11 +1165,9 @@ class FloatingWindow(
                     offlineNoticeShown = false
                     client.reconnect()
                 }
-
                 MENU_CLEAR -> clearLog()
                 MENU_COPY -> copyLogToClipboard()
                 MENU_OPACITY -> showOpacityPanel()
-
                 MENU_SETTINGS -> {
                     minimize()
                     listener.onOpenSettings()
@@ -1142,7 +1273,27 @@ class FloatingWindow(
         const val MENU_COPY = 3
         const val MENU_OPACITY = 4
         const val MENU_SETTINGS = 5
+
         const val MAX_LOG_LINES = 500
         const val MAX_HISTORY = 50
+
+        const val TYPE_NORMAL = 0
+        const val TYPE_SUCCESS = 1
+        const val TYPE_WARNING = 2
+        const val TYPE_ERROR = 3
+        const val TYPE_INFO = 4
+        const val TYPE_COMMAND = 5
+
+        val C_BG = Color.rgb(11, 16, 24)
+        val C_INPUT_BG = Color.rgb(17, 25, 37)
+        val C_DIVIDER = Color.rgb(38, 51, 67)
+        val C_TEXT = Color.rgb(215, 224, 234)
+        val C_MUTED = Color.rgb(105, 121, 140)
+        val C_PURPLE = Color.rgb(192, 132, 252)
+        val C_AMBER = Color.rgb(251, 191, 36)
+        val C_GREEN = Color.rgb(85, 214, 162)
+        val C_GREEN_DARK = Color.rgb(23, 107, 80)
+        val C_RED = Color.rgb(255, 107, 107)
+        val C_CYAN = Color.rgb(92, 214, 238)
     }
 }
