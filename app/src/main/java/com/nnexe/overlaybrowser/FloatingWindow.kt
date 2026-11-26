@@ -1,3 +1,4 @@
+
 package com.nnexe.overlaybrowser
 
 import android.annotation.SuppressLint
@@ -10,6 +11,7 @@ import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -37,16 +39,10 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-/**
- * Floating Frida-Gum agent console: an overlay window with a toolbar, scrolling monospace output,
- * command input bar, and a minimized floating bubble.
- */
 @SuppressLint("ClickableViewAccessibility", "InflateParams")
 class FloatingWindow(
     private val ctx: Context,
@@ -70,7 +66,6 @@ class FloatingWindow(
         .let { if (it != 0) ctx.resources.getDimensionPixelSize(it) else 0 }
     private val main = Handler(Looper.getMainLooper())
     private val imm = ctx.getSystemService(InputMethodManager::class.java)
-    private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private val root = LayoutInflater.from(ctx).inflate(R.layout.overlay_window, null) as OverlayRootView
     private val toolbar: View = root.findViewById(R.id.toolbar)
@@ -94,17 +89,25 @@ class FloatingWindow(
 
     private val bounds = Rect()
     private val params = overlayParams(0, 0)
-    private val bubbleParams = overlayParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT)
+    private val bubbleParams = overlayParams(
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.WRAP_CONTENT,
+    )
+
     private var rootAdded = false
     private var bubbleAdded = false
     private var interacting = false
     private var keyboardTop = 0
-
     private var locked = prefs.locked
     private var outputPaused = prefs.pausedOutput
+    private var typing = false
+    private var lastConnectionState: Boolean? = null
+    private var hasConnectedBefore = false
+    private var offlineNoticeShown = false
+    private var pendingInitialCommand: String? = initialCommand
+
     var isMinimized = false
         private set
-    private var typing = false
 
     private lateinit var logScroll: ScrollView
     private lateinit var logText: TextView
@@ -118,12 +121,50 @@ class FloatingWindow(
     private val client = AgentClient(
         host = prefs.host,
         port = prefs.port,
-        onLine = { line -> main.post { appendLine("<< $line") } },
+        onLine = { line ->
+            main.post {
+                if (line.isNotBlank()) appendLine(line)
+            }
+        },
         onStatus = { connected, status ->
             main.post {
-                statusField.setText(status)
-                statusField.setTextColor(if (connected) Color.parseColor("#6EE7B7") else Color.parseColor("#FCA5A5"))
-                appendLine("[sys] $status")
+                if (status.startsWith("Connecting", true)) {
+                    statusField.setText("WAITING FOR GAME")
+                    statusField.setTextColor(Color.parseColor("#F0B35A"))
+                } else if (connected) {
+                    statusField.setText("● CONNECTED")
+                    statusField.setTextColor(Color.parseColor("#55D6A2"))
+
+                    if (lastConnectionState != true) {
+                        appendLine(
+                            if (hasConnectedBefore) "Connection restored."
+                            else "AIZ3N agent connected."
+                        )
+                    }
+
+                    lastConnectionState = true
+                    hasConnectedBefore = true
+                    offlineNoticeShown = false
+
+                    val pending = pendingInitialCommand
+                    pendingInitialCommand = null
+                    if (!pending.isNullOrBlank()) sendCommand(pending)
+                } else if (status != "Stopped") {
+                    statusField.setText("WAITING FOR GAME")
+                    statusField.setTextColor(Color.parseColor("#F0B35A"))
+
+                    if (lastConnectionState != false) {
+                        appendLine(
+                            if (hasConnectedBefore) {
+                                "Connection lost. Waiting for the game..."
+                            } else {
+                                "Game not detected. Launch the game with AIZ3N enabled. Waiting for connection..."
+                            }
+                        )
+                    }
+
+                    lastConnectionState = false
+                }
             }
         },
     )
@@ -132,21 +173,25 @@ class FloatingWindow(
         loadBounds()
         buildConsoleView()
         wireToolbar()
-        resizeLeft.setOnTouchListener(resizeListener(fromLeft = true))
-        resizeRight.setOnTouchListener(resizeListener(fromLeft = false))
+
+        resizeLeft.setOnTouchListener(resizeListener(true))
+        resizeRight.setOnTouchListener(resizeListener(false))
         bubbleIcon.setOnTouchListener(bubbleListener())
 
         root.isFocusableInTouchMode = true
         root.onOutsideTouch = { stopTyping() }
         root.onBack = { handleBack() }
+
         root.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
             if (right - left != oldRight - oldLeft) main.post { fitToolbar() }
         }
+
         root.setOnApplyWindowInsetsListener { _, insets ->
             trackKeyboard(insets)
             main.post { avoidSystemBars() }
             insets
         }
+
         if (Build.VERSION.SDK_INT >= 29) {
             for (handle in listOf(dragHandle, resizeLeft, resizeRight)) {
                 handle.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
@@ -162,31 +207,43 @@ class FloatingWindow(
         rootAdded = true
 
         client.start()
-        if (!initialCommand.isNullOrBlank()) {
-            sendCommand(initialCommand)
-        }
     }
 
-    // region Console UI
+    // Console
+
+    private fun roundedBackground(
+        color: Int,
+        radius: Int,
+        strokeColor: Int = Color.TRANSPARENT,
+        strokeWidth: Int = 0,
+    ) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radius).toFloat()
+        if (strokeWidth > 0) setStroke(dp(strokeWidth), strokeColor)
+    }
 
     private fun buildConsoleView() {
         contentHolder.removeAllViews()
 
         val container = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#CC0D1117"))
+            setBackgroundColor(Color.parseColor("#0B1018"))
         }
 
         logText = TextView(ctx).apply {
-            typeface = Typeface.MONOSPACE
+            typeface = Typeface.create("monospace", Typeface.NORMAL)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(Color.parseColor("#E6EDF3"))
+            setTextColor(Color.parseColor("#D7E0EA"))
             setTextIsSelectable(true)
-            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setText("AIZ3N TERMINAL\n\nWaiting for agent connection...")
         }
 
         logScroll = ScrollView(ctx).apply {
             isFillViewport = true
+            isVerticalScrollBarEnabled = true
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
             addView(
                 logText,
                 FrameLayout.LayoutParams(
@@ -196,53 +253,66 @@ class FloatingWindow(
             )
         }
 
+        val divider = View(ctx).apply {
+            setBackgroundColor(Color.parseColor("#263343"))
+        }
+
         val inputBar = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#E6161B22"))
-            setPadding(dp(6), dp(4), dp(6), dp(4))
+            setBackgroundColor(Color.parseColor("#111925"))
+            setPadding(dp(9), dp(7), dp(9), dp(7))
         }
 
         val prompt = TextView(ctx).apply {
-            text = ">"
-            typeface = Typeface.MONOSPACE
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            setTextColor(Color.parseColor("#58A6FF"))
-            setPadding(dp(4), 0, dp(6), 0)
+            text = "AIZ3N"
+            typeface = Typeface.create("monospace", Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(Color.parseColor("#65B8FF"))
+            setPadding(dp(3), 0, dp(9), 0)
         }
 
         cmdInput = EditText(ctx).apply {
-            hint = "Enter agent command..."
-            setHintTextColor(Color.parseColor("#6E7681"))
-            setTextColor(Color.WHITE)
+            hint = "Enter command..."
+            setHintTextColor(Color.parseColor("#69798C"))
+            setTextColor(Color.parseColor("#F0F4F8"))
             typeface = Typeface.MONOSPACE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             background = null
             setSingleLine(true)
             imeOptions = EditorInfo.IME_ACTION_SEND or EditorInfo.IME_FLAG_NO_EXTRACT_UI
-            setPadding(dp(2), dp(6), dp(6), dp(6))
+            setPadding(dp(3), dp(7), dp(5), dp(7))
+            isSelectAllOnFocus = false
 
             setOnTouchListener { _, e ->
                 if (e.actionMasked == MotionEvent.ACTION_DOWN) {
                     startTyping()
-                    main.postDelayed({ if (typing && hasFocus()) imm.showSoftInput(this, 0) }, 200)
+                    main.postDelayed({
+                        if (typing && hasFocus()) imm.showSoftInput(this, 0)
+                    }, 200)
                 }
                 false
             }
+
             setOnFocusChangeListener { _, hasFocus ->
                 if (!hasFocus) {
-                    main.postDelayed({ if (!cmdInput.hasFocus()) stopTyping() }, 250)
+                    main.postDelayed({
+                        if (!cmdInput.hasFocus()) stopTyping()
+                    }, 250)
                 }
             }
+
             setOnEditorActionListener { _, actionId, event ->
-                val enter = event != null && event.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN
+                val enter = event != null &&
+                    event.keyCode == KeyEvent.KEYCODE_ENTER &&
+                    event.action == KeyEvent.ACTION_DOWN
+
                 if (actionId == EditorInfo.IME_ACTION_SEND || enter) {
                     submitInput()
                     true
-                } else {
-                    false
-                }
+                } else false
             }
+
             setOnKeyListener { _, keyCode, event ->
                 if (event.action == KeyEvent.ACTION_DOWN) {
                     when (keyCode) {
@@ -256,19 +326,23 @@ class FloatingWindow(
                         }
                         else -> false
                     }
-                } else {
-                    false
-                }
+                } else false
             }
         }
 
         btnSend = TextView(ctx).apply {
             text = "SEND"
-            typeface = Typeface.MONOSPACE
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            gravity = Gravity.CENTER
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#238636"))
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            background = roundedBackground(
+                Color.parseColor("#176B50"),
+                8,
+                Color.parseColor("#269B72"),
+                1,
+            )
+            setPadding(dp(14), dp(9), dp(14), dp(9))
             setOnClickListener { submitInput() }
         }
 
@@ -281,33 +355,58 @@ class FloatingWindow(
 
         container.addView(
             logScroll,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f),
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
+            ),
+        )
+        container.addView(
+            divider,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(1),
+            ),
         )
         container.addView(
             inputBar,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT),
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
         )
 
         contentHolder.addView(
             container,
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
         )
     }
 
     private fun submitInput() {
         val raw = cmdInput.text.toString().trim()
         if (raw.isEmpty()) return
+
+        if (!client.isConnected) {
+            showOfflineNotice()
+            return
+        }
+
         cmdInput.setText("")
         sendCommand(raw)
     }
 
     private fun stepHistory(delta: Int) {
         if (commandHistory.isEmpty()) return
+
         if (historyIndex == -1 && delta < 0) {
             historyIndex = commandHistory.size - 1
         } else {
             historyIndex = (historyIndex + delta).coerceIn(-1, commandHistory.size - 1)
         }
+
         if (historyIndex >= 0) {
             cmdInput.setText(commandHistory[historyIndex])
             cmdInput.setSelection(cmdInput.text.length)
@@ -317,14 +416,12 @@ class FloatingWindow(
     }
 
     private fun appendLine(text: String) {
-        val stamp = timeFmt.format(Date())
-        logLines.addLast("[$stamp] $text")
-        while (logLines.size > MAX_LOG_LINES) {
-            logLines.removeFirst()
-        }
-        if (!outputPaused) {
-            renderLog()
-        }
+        if (text.isBlank()) return
+
+        logLines.addLast(text)
+        while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
+
+        if (!outputPaused) renderLog()
     }
 
     private fun renderLog() {
@@ -339,29 +436,41 @@ class FloatingWindow(
 
     private fun copyLogToClipboard() {
         val cm = ctx.getSystemService(ClipboardManager::class.java)
-        cm.setPrimaryClip(ClipData.newPlainText("FridaGum Console", logLines.joinToString("\n")))
-        Toast.makeText(ctx, "Log copied", Toast.LENGTH_SHORT).show()
+        cm.setPrimaryClip(
+            ClipData.newPlainText("AIZ3N Terminal", logLines.joinToString("\n"))
+        )
+        Toast.makeText(ctx, "Output copied", Toast.LENGTH_SHORT).show()
     }
 
-    // endregion
+    private fun showOfflineNotice() {
+        if (offlineNoticeShown) return
+        offlineNoticeShown = true
+        appendLine("Not connected. Launch the game with AIZ3N enabled, then reconnect.")
+    }
 
-    // region Public controls
+    // Public controls
 
     fun load(commandOrText: String) {
         val trimmed = commandOrText.trim()
-        if (trimmed.isNotEmpty()) {
-            sendCommand(trimmed)
-        }
+        if (trimmed.isNotEmpty()) sendCommand(trimmed)
     }
 
     fun sendCommand(command: String) {
-        if (commandHistory.lastOrNull() != command) {
-            commandHistory.add(command)
+        val value = command.trim()
+        if (value.isEmpty()) return
+
+        if (!client.isConnected) {
+            showOfflineNotice()
+            return
+        }
+
+        if (commandHistory.lastOrNull() != value) {
+            commandHistory.add(value)
             if (commandHistory.size > MAX_HISTORY) commandHistory.removeAt(0)
         }
+
         historyIndex = -1
-        appendLine(">> $command")
-        client.send(command)
+        client.send(value)
     }
 
     fun minimize() {
@@ -405,9 +514,7 @@ class FloatingWindow(
         }
     }
 
-    // endregion
-
-    // region Window placement
+    // Window placement
 
     private fun overlayParams(w: Int, h: Int) = WindowManager.LayoutParams(
         w,
@@ -421,7 +528,8 @@ class FloatingWindow(
     ).apply {
         gravity = Gravity.TOP or Gravity.START
         if (Build.VERSION.SDK_INT >= 28) {
-            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
         if (Build.VERSION.SDK_INT >= 30) fitInsetsTypes = 0
     }
@@ -431,6 +539,7 @@ class FloatingWindow(
             val b = wm.maximumWindowMetrics.bounds
             return Rect(0, 0, b.width(), b.height())
         }
+
         val dm = DisplayMetrics()
         @Suppress("DEPRECATION")
         wm.defaultDisplay.getRealMetrics(dm)
@@ -441,26 +550,30 @@ class FloatingWindow(
         val s = screen()
         var w = prefs.width
         var h = prefs.height
+
         if (w <= 0 || h <= 0) {
             w = (s.width() * 0.55f).roundToInt()
             h = (s.height() * 0.65f).roundToInt()
         }
+
         var x = prefs.x
         var y = prefs.y
+
         if (x < 0 || y < 0) {
             x = s.width() - w - dp(12)
             y = dp(12)
         }
+
         bounds.set(x, y, x + w, y + h)
         clampBounds()
     }
 
     private fun clampBounds() {
         val s = screen()
-        val w = bounds.width().clamp(minWidth, s.width())
-        val h = bounds.height().clamp(minHeight, s.height())
-        val x = bounds.left.clamp(0, s.width() - w)
-        val y = bounds.top.clamp(0, s.height() - h)
+        val w = bounds.width().coerceIn(minWidth, s.width())
+        val h = bounds.height().coerceIn(minHeight, s.height())
+        val x = bounds.left.coerceIn(0, s.width() - w)
+        val y = bounds.top.coerceIn(0, s.height() - h)
         bounds.set(x, y, x + w, y + h)
     }
 
@@ -473,6 +586,7 @@ class FloatingWindow(
 
     private fun applyWindowLayout() {
         val touchFlag = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+
         if (isMinimized) {
             params.x = bounds.left
             params.y = bounds.top
@@ -483,10 +597,12 @@ class FloatingWindow(
         } else {
             var top = bounds.top
             var height = bounds.height()
+
             if (typing && keyboardTop > 0 && bounds.bottom > keyboardTop) {
                 top = (keyboardTop - height).coerceAtLeast(statusBarHeight)
                 height = (keyboardTop - top).coerceAtLeast(dp(110))
             }
+
             params.x = bounds.left
             params.y = top
             params.width = bounds.width()
@@ -497,14 +613,18 @@ class FloatingWindow(
 
         val focusFlag = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         val outsideFlag = WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+
         if (typing && !isMinimized) {
             params.flags = (params.flags and focusFlag.inv()) or outsideFlag
-            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or
-                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+            params.softInputMode =
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
         } else {
             params.flags = (params.flags or focusFlag) and outsideFlag.inv()
-            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED
+            params.softInputMode =
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED
         }
+
         if (rootAdded) wm.updateViewLayout(root, params)
     }
 
@@ -516,6 +636,7 @@ class FloatingWindow(
 
         override fun onTouch(v: View, e: MotionEvent): Boolean {
             if (locked || isMinimized) return false
+
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     interacting = true
@@ -524,13 +645,19 @@ class FloatingWindow(
                     startX = bounds.left
                     startY = bounds.top
                 }
+
                 MotionEvent.ACTION_MOVE -> {
-                    bounds.offsetTo(startX + (e.rawX - downX).roundToInt(), startY + (e.rawY - downY).roundToInt())
+                    bounds.offsetTo(
+                        startX + (e.rawX - downX).roundToInt(),
+                        startY + (e.rawY - downY).roundToInt(),
+                    )
                     clampBounds()
                     applyWindowLayout()
                 }
+
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endInteraction()
             }
+
             return true
         }
     }
@@ -542,6 +669,7 @@ class FloatingWindow(
 
         override fun onTouch(v: View, e: MotionEvent): Boolean {
             if (locked || isMinimized) return false
+
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     interacting = true
@@ -549,22 +677,36 @@ class FloatingWindow(
                     downY = e.rawY
                     start.set(bounds)
                 }
+
                 MotionEvent.ACTION_MOVE -> {
                     val s = screen()
                     val dx = (e.rawX - downX).roundToInt()
                     val dy = (e.rawY - downY).roundToInt()
-                    val bottom = (start.bottom + dy).clamp(start.top + minHeight, s.height())
+                    val bottom = (start.bottom + dy).coerceIn(
+                        start.top + minHeight,
+                        s.height(),
+                    )
+
                     if (fromLeft) {
-                        val left = (start.left + dx).clamp(0, start.right - minWidth)
+                        val left = (start.left + dx).coerceIn(
+                            0,
+                            start.right - minWidth,
+                        )
                         bounds.set(left, start.top, start.right, bottom)
                     } else {
-                        val right = (start.right + dx).clamp(start.left + minWidth, s.width())
+                        val right = (start.right + dx).coerceIn(
+                            start.left + minWidth,
+                            s.width(),
+                        )
                         bounds.set(start.left, start.top, right, bottom)
                     }
+
                     applyWindowLayout()
                 }
+
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endInteraction()
             }
+
             return true
         }
     }
@@ -577,12 +719,14 @@ class FloatingWindow(
 
     private fun avoidSystemBars() {
         if (interacting || isMinimized || keyboardTop > 0 || !rootAdded) return
+
         val insets = root.rootWindowInsets ?: return
         val coveredTop: Int
         val coveredBottom: Int
+
         if (Build.VERSION.SDK_INT >= 30) {
             val i = insets.getInsets(
-                WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
+                WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()
             )
             coveredTop = i.top
             coveredBottom = i.bottom
@@ -592,27 +736,37 @@ class FloatingWindow(
             @Suppress("DEPRECATION")
             coveredBottom = insets.systemWindowInsetBottom
         }
+
         if (coveredTop <= 0 && coveredBottom <= 0) return
+
         val s = screen()
         var top = bounds.top
         var bottom = bounds.bottom
+
         if (coveredTop > 0 && top < coveredTop) {
-            val shift = (coveredTop - top).coerceAtMost((s.height() - coveredBottom - bottom).coerceAtLeast(0))
+            val shift = (coveredTop - top).coerceAtMost(
+                (s.height() - coveredBottom - bottom).coerceAtLeast(0)
+            )
             top += shift
             bottom += shift
         }
+
         if (coveredBottom > 0 && bottom > s.height() - coveredBottom) {
             bottom = (s.height() - coveredBottom).coerceAtLeast(top + minHeight)
         }
+
         if (top == bounds.top && bottom == bounds.bottom) return
-        val prev = Rect(bounds)
+
+        val previous = Rect(bounds)
         bounds.set(bounds.left, top, bounds.right, bottom)
         clampBounds()
-        if (bounds != prev) applyWindowLayout()
+
+        if (bounds != previous) applyWindowLayout()
     }
 
     private fun trackKeyboard(insets: WindowInsets) {
         if (Build.VERSION.SDK_INT < 30) return
+
         val top = if (!typing || !insets.isVisible(WindowInsets.Type.ime())) {
             0
         } else {
@@ -621,26 +775,35 @@ class FloatingWindow(
                 val frame = IntArray(2)
                 root.getLocationOnScreen(frame)
                 frame[1] + root.height - covered
-            } else {
-                keyboardTop
-            }
+            } else keyboardTop
         }
+
         if (top != keyboardTop) {
             keyboardTop = top
             main.post { applyWindowLayout() }
         }
     }
 
-    // endregion
-
-    // region Bubble
+    // Bubble
 
     private fun showBubble() {
         if (bubbleAdded) return
+
         val s = screen()
         val size = dp(58)
-        bubbleParams.x = if (prefs.bubbleX >= 0) prefs.bubbleX else s.width() - size - dp(8)
-        bubbleParams.y = if (prefs.bubbleY >= 0) prefs.bubbleY else s.height() * 3 / 5
+
+        bubbleParams.x = if (prefs.bubbleX >= 0) {
+            prefs.bubbleX
+        } else {
+            s.width() - size - dp(8)
+        }
+
+        bubbleParams.y = if (prefs.bubbleY >= 0) {
+            prefs.bubbleY
+        } else {
+            s.height() * 3 / 5
+        }
+
         clampBubble()
         wm.addView(bubble, bubbleParams)
         bubbleAdded = true
@@ -655,8 +818,8 @@ class FloatingWindow(
     private fun clampBubble() {
         val s = screen()
         val size = dp(58)
-        bubbleParams.x = bubbleParams.x.clamp(0, s.width() - size)
-        bubbleParams.y = bubbleParams.y.clamp(0, s.height() - size)
+        bubbleParams.x = bubbleParams.x.coerceIn(0, s.width() - size)
+        bubbleParams.y = bubbleParams.y.coerceIn(0, s.height() - size)
     }
 
     private fun bubbleListener() = object : View.OnTouchListener {
@@ -666,6 +829,7 @@ class FloatingWindow(
         private var startY = 0
         private var dragging = false
         private var longPressed = false
+
         private val longPress = Runnable {
             longPressed = true
             showBubbleMenu()
@@ -681,15 +845,23 @@ class FloatingWindow(
                     dragging = false
                     longPressed = false
                     v.isPressed = true
-                    v.postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
+                    v.postDelayed(
+                        longPress,
+                        ViewConfiguration.getLongPressTimeout().toLong(),
+                    )
                 }
+
                 MotionEvent.ACTION_MOVE -> {
                     val dx = e.rawX - downX
                     val dy = e.rawY - downY
-                    if (!dragging && !longPressed && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
+
+                    if (!dragging && !longPressed &&
+                        (abs(dx) > touchSlop || abs(dy) > touchSlop)
+                    ) {
                         dragging = true
                         v.removeCallbacks(longPress)
                     }
+
                     if (dragging) {
                         bubbleParams.x = startX + dx.roundToInt()
                         bubbleParams.y = startY + dy.roundToInt()
@@ -697,9 +869,11 @@ class FloatingWindow(
                         wm.updateViewLayout(bubble, bubbleParams)
                     }
                 }
+
                 MotionEvent.ACTION_UP -> {
                     v.isPressed = false
                     v.removeCallbacks(longPress)
+
                     if (dragging) {
                         prefs.bubbleX = bubbleParams.x
                         prefs.bubbleY = bubbleParams.y
@@ -707,11 +881,13 @@ class FloatingWindow(
                         restore()
                     }
                 }
+
                 MotionEvent.ACTION_CANCEL -> {
                     v.isPressed = false
                     v.removeCallbacks(longPress)
                 }
             }
+
             return true
         }
     }
@@ -721,6 +897,7 @@ class FloatingWindow(
         popup.menu.add(0, 1, 0, R.string.restore)
         popup.menu.add(0, 2, 1, "Reconnect")
         popup.menu.add(0, 3, 2, R.string.close)
+
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> restore()
@@ -729,37 +906,38 @@ class FloatingWindow(
             }
             true
         }
+
         popup.show()
     }
 
-    // endregion
-
-    // region Toolbar & Focus
+    // Toolbar and focus
 
     private fun wireToolbar() {
         val mover = moveListener()
         dragHandle.setOnTouchListener(mover)
         toolbar.setOnTouchListener(mover)
 
-        // Make the top bar field a read-only connection status banner
-        statusField.isFocusable = false
-        statusField.isFocusableInTouchMode = false
-        statusField.isCursorVisible = false
-        statusField.keyListener = null
-        statusField.ellipsize = TextUtils.TruncateAt.END
-        statusField.typeface = Typeface.MONOSPACE
-        statusField.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-        statusField.setText("Connecting to ${prefs.host}:${prefs.port}...")
-        statusField.setOnTouchListener(mover)
+        statusField.apply {
+            isFocusable = false
+            isFocusableInTouchMode = false
+            isCursorVisible = false
+            keyListener = null
+            ellipsize = TextUtils.TruncateAt.END
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setText("WAITING FOR GAME")
+            setTextColor(Color.parseColor("#F0B35A"))
+            setOnTouchListener(mover)
+        }
 
         progress.visibility = View.GONE
         btnFit.visibility = View.GONE
         btnBack.visibility = View.GONE
 
-        // Reuse reload button to reconnect TCP socket
         btnReload.contentDescription = "Reconnect"
         btnReload.setOnClickListener {
-            appendLine("[sys] Reconnecting...")
+            appendLine("Reconnecting...")
+            offlineNoticeShown = false
             client.reconnect()
         }
 
@@ -779,29 +957,51 @@ class FloatingWindow(
         outputPaused = !outputPaused
         prefs.pausedOutput = outputPaused
         updatePauseUi()
-        if (!outputPaused) {
-            renderLog()
-        }
-        Toast.makeText(ctx, if (outputPaused) "Output paused" else "Output resumed", Toast.LENGTH_SHORT).show()
+
+        if (!outputPaused) renderLog()
+
+        Toast.makeText(
+            ctx,
+            if (outputPaused) "Output paused" else "Output resumed",
+            Toast.LENGTH_SHORT,
+        ).show()
     }
 
     private fun updatePauseUi() {
-        btnMute.setImageResource(if (outputPaused) R.drawable.ic_volume_off else R.drawable.ic_volume_on)
-        btnMute.imageTintList = ColorStateList.valueOf(ctx.getColor(if (outputPaused) R.color.accent else R.color.text))
-        btnMute.contentDescription = if (outputPaused) "Resume output" else "Pause output"
+        btnMute.setImageResource(
+            if (outputPaused) R.drawable.ic_volume_off else R.drawable.ic_volume_on
+        )
+        btnMute.imageTintList = ColorStateList.valueOf(
+            ctx.getColor(if (outputPaused) R.color.accent else R.color.text)
+        )
+        btnMute.contentDescription =
+            if (outputPaused) "Resume output" else "Pause output"
     }
 
     private fun toggleLock() {
         locked = !locked
         prefs.locked = locked
         updateLockUi()
-        Toast.makeText(ctx, if (locked) R.string.locked else R.string.unlocked, Toast.LENGTH_SHORT).show()
+
+        Toast.makeText(
+            ctx,
+            if (locked) R.string.locked else R.string.unlocked,
+            Toast.LENGTH_SHORT,
+        ).show()
     }
 
     private fun updateLockUi() {
-        btnLock.setImageResource(if (locked) R.drawable.ic_lock else R.drawable.ic_lock_open)
-        btnLock.imageTintList = ColorStateList.valueOf(ctx.getColor(if (locked) R.color.accent else R.color.text))
-        root.setBackgroundResource(if (locked) R.drawable.bg_window_locked else R.drawable.bg_window)
+        btnLock.setImageResource(
+            if (locked) R.drawable.ic_lock else R.drawable.ic_lock_open
+        )
+        btnLock.imageTintList = ColorStateList.valueOf(
+            ctx.getColor(if (locked) R.color.accent else R.color.text)
+        )
+
+        root.setBackgroundResource(
+            if (locked) R.drawable.bg_window_locked else R.drawable.bg_window
+        )
+
         dragHandle.alpha = if (locked) 0.3f else 1f
         val handles = if (locked) View.GONE else View.VISIBLE
         resizeLeft.visibility = handles
@@ -811,18 +1011,32 @@ class FloatingWindow(
     private fun showMenu() {
         val popup = PopupMenu(ctx, btnMenu)
         val menu = popup.menu
+
         menu.add(0, MENU_RECONNECT, 0, "Reconnect (${prefs.host}:${prefs.port})")
         menu.add(0, MENU_CLEAR, 1, "Clear Console")
         menu.add(0, MENU_COPY, 2, "Copy Output")
-        menu.add(0, MENU_OPACITY, 3, ctx.getString(R.string.menu_opacity, (prefs.opacity * 100).roundToInt()))
+        menu.add(
+            0,
+            MENU_OPACITY,
+            3,
+            ctx.getString(
+                R.string.menu_opacity,
+                (prefs.opacity * 100).roundToInt(),
+            ),
+        )
         menu.add(0, MENU_SETTINGS, 4, R.string.menu_settings)
 
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
-                MENU_RECONNECT -> client.reconnect()
+                MENU_RECONNECT -> {
+                    offlineNoticeShown = false
+                    client.reconnect()
+                }
+
                 MENU_CLEAR -> clearLog()
                 MENU_COPY -> copyLogToClipboard()
                 MENU_OPACITY -> showOpacityPanel()
+
                 MENU_SETTINGS -> {
                     minimize()
                     listener.onOpenSettings()
@@ -830,6 +1044,7 @@ class FloatingWindow(
             }
             true
         }
+
         popup.show()
     }
 
@@ -852,23 +1067,49 @@ class FloatingWindow(
         seek.keyProgressIncrement = 5
         seek.progress = (prefs.opacity * 100).roundToInt()
         value.text = ctx.getString(R.string.percent, seek.progress)
+
         seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+            override fun onProgressChanged(
+                bar: SeekBar,
+                progress: Int,
+                fromUser: Boolean,
+            ) {
                 if (fromUser) setPercent(progress)
             }
 
             override fun onStartTrackingTouch(bar: SeekBar) {}
-
             override fun onStopTrackingTouch(bar: SeekBar) {}
         })
-        panel.findViewById<View>(R.id.opacity_minus).setOnClickListener { setPercent((seek.progress - 1) / 5 * 5) }
-        panel.findViewById<View>(R.id.opacity_plus).setOnClickListener { setPercent((seek.progress / 5 + 1) * 5) }
-        for ((id, pct) in listOf(R.id.opacity_25 to 25, R.id.opacity_50 to 50, R.id.opacity_75 to 75, R.id.opacity_100 to 100)) {
-            panel.findViewById<View>(id).setOnClickListener { setPercent(pct) }
+
+        panel.findViewById<View>(R.id.opacity_minus).setOnClickListener {
+            setPercent((seek.progress - 1) / 5 * 5)
         }
 
-        val popup = PopupWindow(panel, dp(280), WindowManager.LayoutParams.WRAP_CONTENT, true)
-        popup.setBackgroundDrawable(ctx.getDrawable(R.drawable.bg_card) ?: ColorDrawable(Color.DKGRAY))
+        panel.findViewById<View>(R.id.opacity_plus).setOnClickListener {
+            setPercent((seek.progress / 5 + 1) * 5)
+        }
+
+        for ((id, pct) in listOf(
+            R.id.opacity_25 to 25,
+            R.id.opacity_50 to 50,
+            R.id.opacity_75 to 75,
+            R.id.opacity_100 to 100,
+        )) {
+            panel.findViewById<View>(id).setOnClickListener {
+                setPercent(pct)
+            }
+        }
+
+        val popup = PopupWindow(
+            panel,
+            dp(280),
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            true,
+        )
+
+        popup.setBackgroundDrawable(
+            ctx.getDrawable(R.drawable.bg_card) ?: ColorDrawable(Color.DKGRAY)
+        )
         popup.elevation = dp(8).toFloat()
         popup.isOutsideTouchable = true
         popup.showAsDropDown(btnMenu, 0, dp(4), Gravity.END)
@@ -882,8 +1123,10 @@ class FloatingWindow(
 
     private fun stopTyping() {
         if (!typing) return
+
         imm.hideSoftInputFromWindow(root.windowToken, 0)
         if (cmdInput.hasFocus()) root.requestFocus()
+
         typing = false
         keyboardTop = 0
         applyWindowLayout()
@@ -892,10 +1135,6 @@ class FloatingWindow(
     private fun handleBack() {
         if (typing) stopTyping()
     }
-
-    // endregion
-
-    private fun Int.clamp(lo: Int, hi: Int) = if (hi < lo) lo else coerceIn(lo, hi)
 
     private companion object {
         const val MENU_RECONNECT = 1
