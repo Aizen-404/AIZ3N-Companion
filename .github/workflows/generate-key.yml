@@ -1,0 +1,30 @@
+
+name: Generate AIZ3N Signing Key
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate keystore
+        env:
+          STORE_PASSWORD: ${{ secrets.AIZ3N_STORE_PASSWORD }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore aiz3n-release.jks \
+            -storepass "$STORE_PASSWORD" \
+            -keypass "$STORE_PASSWORD" \
+            -alias aiz3n \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=AIZ3N, OU=Companion, O=AIZ3N, C=PK"
+
+      - name: Save keystore artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIZ3N-Permanent-Keystore
+          path: aiz3n-release.jks
+          retention-days: 90

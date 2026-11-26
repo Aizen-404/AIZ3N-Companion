@@ -574,7 +574,7 @@ class FloatingWindow(
         }
 
         try {
-            var fileName = "selected file"
+            var fileName = ""
             ctx.contentResolver.query(
                 uri,
                 arrayOf(OpenableColumns.DISPLAY_NAME),
@@ -584,13 +584,19 @@ class FloatingWindow(
             )?.use { cursor ->
                 if (cursor.moveToFirst()) {
                     val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (index >= 0) fileName = cursor.getString(index) ?: fileName
+                    if (index >= 0) fileName = cursor.getString(index).orEmpty()
                 }
             }
-
+            if (fileName.isBlank()) {
+                fileName = Uri.decode(uri.lastPathSegment.orEmpty())
+                    .substringAfterLast('/')
+                    .substringAfterLast(':')
+            }
+            fileName = fileName.trim()
             val lowerName = fileName.lowercase()
             if (!lowerName.endsWith(".ts") && !lowerName.endsWith(".js")) {
-                appendLine("Only .ts and .js files are supported.", TYPE_ERROR)
+                appendLine("Unsupported file: $fileName", TYPE_ERROR)
+                appendLine("Select a .ts or .js script file.", TYPE_WARNING)
                 return
             }
 
