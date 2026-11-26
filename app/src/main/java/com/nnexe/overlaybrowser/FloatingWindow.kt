@@ -2,52 +2,36 @@
 package com.nnexe.overlaybrowser
 
 import android.annotation.SuppressLint
-import android.content.BroadcastReceiver
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
-import android.graphics.drawable.GradientDrawable
-import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.text.SpannableStringBuilder
 import android.text.TextUtils
-import android.text.style.ForegroundColorSpan
-import android.text.style.StyleSpan
 import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowInsets
 import android.view.WindowManager
-import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
-import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.PopupWindow
-import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
-import android.provider.OpenableColumns
-import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -111,79 +95,52 @@ class FloatingWindow(
     private var interacting = false
     private var keyboardTop = 0
     private var locked = prefs.locked
-    private var outputPaused = prefs.pausedOutput
     private var typing = false
     private var lastConnectionState: Boolean? = null
     private var hasConnectedBefore = false
-    private var offlineNoticeShown = false
     private var pendingInitialCommand: String? = initialCommand
-    private var fileReceiverRegistered = false
-
-    private val filePickerReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            val rawUri = intent.getStringExtra(MainActivity.EXTRA_FILE_URI)
-            if (rawUri.isNullOrBlank()) {
-                appendLine("File selection cancelled.", TYPE_WARNING)
-                return
-            }
-            loadSelectedFile(Uri.parse(rawUri))
-        }
-    }
 
     var isMinimized = false
         private set
 
-    private lateinit var logScroll: ScrollView
-    private lateinit var logText: TextView
-    private lateinit var cmdInput: EditText
-    private lateinit var btnSend: TextView
-    private lateinit var btnAttach: TextView
-
-    private data class LogEntry(val text: String, val type: Int)
-
-    private val logLines = ArrayDeque<LogEntry>()
-    private val commandHistory = mutableListOf<String>()
-    private var historyIndex = -1
+    private lateinit var console: ConsolePanel
 
     private val client = AgentClient(
         host = prefs.host,
         port = prefs.port,
         onLine = { line ->
-            main.post { appendAgentLine(line) }
+            main.post { console.appendAgentLine(line) }
         },
         onStatus = { connected, status ->
             main.post {
-                if (status.startsWith("Connecting", true)) {
-                    setConnectionStatus(false)
-                } else if (connected) {
-                    setConnectionStatus(true)
+                if (connected) {
+                    console.setConnectionState(true)
 
                     if (lastConnectionState != true) {
-                        appendLine(
+                        console.appendLine(
                             if (hasConnectedBefore) "Connection restored."
                             else "AIZ3N agent connected.",
-                            TYPE_SUCCESS
+                            ConsolePanel.TYPE_SUCCESS
                         )
                     }
 
                     lastConnectionState = true
                     hasConnectedBefore = true
-                    offlineNoticeShown = false
 
                     val pending = pendingInitialCommand
                     pendingInitialCommand = null
-                    if (!pending.isNullOrBlank()) sendCommand(pending)
+                    if (!pending.isNullOrBlank()) {
+                        console.sendCommand(pending)
+                    }
                 } else if (status != "Stopped") {
-                    setConnectionStatus(false)
-
                     if (lastConnectionState != false) {
-                        appendLine(
+                        console.appendLine(
                             if (hasConnectedBefore) {
                                 "Connection lost. Waiting for the game..."
                             } else {
                                 "Game not detected. Launch the game with AIZ3N enabled. Waiting for connection..."
                             },
-                            TYPE_WARNING
+                            ConsolePanel.TYPE_WARNING
                         )
                     }
 
@@ -193,9 +150,24 @@ class FloatingWindow(
         },
     )
 
+    private var outputPaused: Boolean
+        get() = console.outputPaused
+        set(value) {
+            console.outputPaused = value
+        }
+
     init {
         loadBounds()
-        buildConsoleView()
+
+        console = ConsolePanel(
+            ctx,
+            contentHolder,
+            client,
+            ::startTyping,
+            ::stopTyping
+        )
+        console.outputPaused = prefs.pausedOutput
+
         wireToolbar()
 
         resizeLeft.setOnTouchListener(resizeListener(true))
@@ -207,7 +179,9 @@ class FloatingWindow(
         root.onBack = { handleBack() }
 
         root.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
-            if (right - left != oldRight - oldLeft) main.post { fitToolbar() }
+            if (right - left != oldRight - oldLeft) {
+                main.post { fitToolbar() }
+            }
         }
 
         root.setOnApplyWindowInsetsListener { _, insets ->
@@ -228,504 +202,24 @@ class FloatingWindow(
         updatePauseUi()
         updateLockUi()
         applyWindowLayout()
-        registerFilePickerReceiver()
+
         wm.addView(root, params)
         rootAdded = true
 
         client.start()
     }
 
-    // Console
-
-    private fun roundedBackground(
-        color: Int,
-        radius: Int,
-        strokeColor: Int = Color.TRANSPARENT,
-        strokeWidth: Int = 0,
-    ) = GradientDrawable().apply {
-        setColor(color)
-        cornerRadius = dp(radius).toFloat()
-        if (strokeWidth > 0) setStroke(dp(strokeWidth), strokeColor)
-    }
-
-    private fun buildConsoleView() {
-        contentHolder.removeAllViews()
-
-        val container = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(C_BG)
-        }
-
-        logText = TextView(ctx).apply {
-            typeface = Typeface.create("monospace", Typeface.NORMAL)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(C_TEXT)
-            setTextIsSelectable(true)
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            setLineSpacing(dp(3).toFloat(), 1f)
-            text = SpannableStringBuilder().apply {
-                appendStyled("AIZ3N CORE", C_PURPLE, true)
-                append("\n")
-                appendStyled("Secure agent console initialized.", C_MUTED)
-                append("\n\n")
-                appendStyled(
-                    "Waiting for agent connection...",
-                    C_AMBER
-                )
-            }
-        }
-
-        logScroll = ScrollView(ctx).apply {
-            isFillViewport = true
-            isVerticalScrollBarEnabled = true
-            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-            addView(
-                logText,
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                ),
-            )
-        }
-
-        val divider = View(ctx).apply {
-            setBackgroundColor(C_DIVIDER)
-        }
-
-        val inputBar = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(C_INPUT_BG)
-            setPadding(dp(9), dp(7), dp(9), dp(7))
-        }
-
-        val prompt = TextView(ctx).apply {
-            typeface = Typeface.create("monospace", Typeface.BOLD)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setPadding(dp(3), 0, dp(8), 0)
-            text = SpannableStringBuilder().apply {
-                appendStyled("[ AIZ3N CORE ] ", C_PURPLE, true)
-                appendStyled("::", C_AMBER, true)
-                appendStyled(" _", Color.WHITE, true)
-            }
-        }
-
-        cmdInput = EditText(ctx).apply {
-            hint = "Enter command..."
-            setHintTextColor(C_MUTED)
-            setTextColor(Color.WHITE)
-            typeface = Typeface.MONOSPACE
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            background = null
-            setSingleLine(true)
-            imeOptions = EditorInfo.IME_ACTION_SEND or
-                EditorInfo.IME_FLAG_NO_EXTRACT_UI
-            setPadding(dp(3), dp(7), dp(5), dp(7))
-
-            setOnTouchListener { _, e ->
-                if (e.actionMasked == MotionEvent.ACTION_DOWN) {
-                    startTyping()
-                    main.postDelayed({
-                        if (typing && hasFocus()) imm.showSoftInput(this, 0)
-                    }, 200)
-                }
-                false
-            }
-
-            setOnFocusChangeListener { _, hasFocus ->
-                if (!hasFocus) {
-                    main.postDelayed({
-                        if (!cmdInput.hasFocus()) stopTyping()
-                    }, 250)
-                }
-            }
-
-            setOnEditorActionListener { _, actionId, event ->
-                val enter = event != null &&
-                    event.keyCode == KeyEvent.KEYCODE_ENTER &&
-                    event.action == KeyEvent.ACTION_DOWN
-
-                if (actionId == EditorInfo.IME_ACTION_SEND || enter) {
-                    submitInput()
-                    true
-                } else false
-            }
-
-            setOnKeyListener { _, keyCode, event ->
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    when (keyCode) {
-                        KeyEvent.KEYCODE_DPAD_UP -> {
-                            stepHistory(-1)
-                            true
-                        }
-                        KeyEvent.KEYCODE_DPAD_DOWN -> {
-                            stepHistory(1)
-                            true
-                        }
-                        else -> false
-                    }
-                } else false
-            }
-        }
-
-        btnAttach = TextView(ctx).apply {
-            text = "ATTACH"
-            gravity = Gravity.CENTER
-            typeface = Typeface.create("sans-serif", Typeface.BOLD)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-            setTextColor(Color.WHITE)
-            background = roundedBackground(
-                C_INPUT_BG,
-                8,
-                C_PURPLE,
-                1,
-            )
-            setPadding(dp(9), dp(9), dp(9), dp(9))
-            setOnClickListener { openFilePicker() }
-        }
-
-        btnSend = TextView(ctx).apply {
-            text = "EXECUTE"
-            gravity = Gravity.CENTER
-            typeface = Typeface.create("sans-serif", Typeface.BOLD)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextColor(Color.WHITE)
-            background = roundedBackground(
-                C_GREEN_DARK,
-                8,
-                C_GREEN,
-                1,
-            )
-            setPadding(dp(13), dp(9), dp(13), dp(9))
-            setOnClickListener { submitInput() }
-        }
-
-        inputBar.addView(prompt)
-        inputBar.addView(
-            cmdInput,
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
-        )
-        inputBar.addView(btnAttach)
-        inputBar.addView(btnSend)
-
-        container.addView(
-            logScroll,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f,
-            ),
-        )
-        container.addView(
-            divider,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(1),
-            ),
-        )
-        container.addView(
-            inputBar,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ),
-        )
-
-        contentHolder.addView(
-            container,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-    }
-
-    private fun SpannableStringBuilder.appendStyled(
-        value: String,
-        color: Int,
-        bold: Boolean = false,
-    ) {
-        val start = length
-        append(value)
-        setSpan(
-            ForegroundColorSpan(color),
-            start,
-            length,
-            SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE
-        )
-        if (bold) {
-            setSpan(
-                StyleSpan(Typeface.BOLD),
-                start,
-                length,
-                SpannableStringBuilder.SPAN_EXCLUSIVE_EXCLUSIVE
-            )
-        }
-    }
-
-    private fun setConnectionStatus(connected: Boolean) {
-        statusField.setText(
-            if (connected) "● CORE CONNECTED" else "WAITING FOR GAME"
-        )
-        statusField.setTextColor(
-            if (connected) C_GREEN else C_AMBER
-        )
-    }
-
-    private fun appendAgentLine(raw: String) {
-        var line = raw.trim()
-        if (line.isEmpty()) return
-
-        // Hide native protocol prompts and response wrappers.
-        val prefixes = listOf("[AIZ3N]==>", "[Response]==>")
-        var changed: Boolean
-
-        do {
-            changed = false
-            for (prefix in prefixes) {
-                if (line.startsWith(prefix, true)) {
-                    line = line.removePrefix(prefix).trim()
-                    changed = true
-                }
-            }
-        } while (changed)
-
-        if (line.isBlank()) return
-
-        // Hide internal initialization noise and decorative banners.
-        if (line.equals("GumJS: Ready", true)) return
-        if (line.equals("AIZ3N TERMINAL", true)) return
-        if (line.all { it == '=' } || line.all { it == '-' }) return
-
-        if (line.startsWith("[Error]", true) ||
-            line.startsWith("Error:", true)
-        ) {
-            appendLine(line, TYPE_ERROR)
-        } else if (
-            line.startsWith("PID:", true) ||
-            line.startsWith("PWD:", true)
-        ) {
-            appendLine(line, TYPE_INFO)
-        } else if (
-            line.startsWith("AIZ3N agent connected", true) ||
-            line.startsWith("Connected", true)
-        ) {
-            // The connection callback already displays this event.
-        } else {
-            appendLine(line, TYPE_NORMAL)
-        }
-    }
-
-    private fun submitInput() {
-        val raw = cmdInput.text.toString().trim()
-        if (raw.isEmpty()) return
-
-        if (raw.equals(".load", true)) {
-            cmdInput.setText("")
-            openFilePicker()
-            return
-        }
-
-        if (!client.isConnected) {
-            showOfflineNotice()
-            return
-        }
-
-        cmdInput.setText("")
-        sendCommand(raw)
-    }
-
-    private fun registerFilePickerReceiver() {
-        if (fileReceiverRegistered) return
-        val filter = IntentFilter(MainActivity.ACTION_FILE_PICKED)
-        if (Build.VERSION.SDK_INT >= 33) {
-            ctx.registerReceiver(
-                filePickerReceiver,
-                filter,
-                Context.RECEIVER_NOT_EXPORTED
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            ctx.registerReceiver(filePickerReceiver, filter)
-        }
-        fileReceiverRegistered = true
-    }
-
-    private fun openFilePicker() {
-        stopTyping()
-        try {
-            ctx.startActivity(
-                Intent(ctx, MainActivity::class.java)
-                    .setAction(MainActivity.ACTION_PICK_FILE)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-        } catch (e: Exception) {
-            appendLine(
-                "Unable to open file picker: ${e.message ?: "unknown error"}",
-                TYPE_ERROR
-            )
-        }
-    }
-
-    private fun loadSelectedFile(uri: Uri) {
-        if (!client.isConnected) {
-            showOfflineNotice()
-            return
-        }
-
-        try {
-            var fileName = ""
-            ctx.contentResolver.query(
-                uri,
-                arrayOf(OpenableColumns.DISPLAY_NAME),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (index >= 0) fileName = cursor.getString(index).orEmpty()
-                }
-            }
-            if (fileName.isBlank()) {
-                fileName = Uri.decode(uri.lastPathSegment.orEmpty())
-                    .substringAfterLast('/')
-                    .substringAfterLast(':')
-            }
-            fileName = fileName.trim()
-            val lowerName = fileName.lowercase()
-            if (!lowerName.endsWith(".ts") && !lowerName.endsWith(".js")) {
-                appendLine("Unsupported file: $fileName", TYPE_ERROR)
-                appendLine("Select a .ts or .js script file.", TYPE_WARNING)
-                return
-            }
-
-            val contents = ctx.contentResolver.openInputStream(uri)?.use {
-                it.readBytes()
-            } ?: throw IllegalStateException("Unable to read selected file")
-
-            appendLine("Loading $fileName...", TYPE_INFO)
-            client.sendLoadFile(contents)
-        } catch (e: Exception) {
-            appendLine(
-                "File load failed: ${e.message ?: "unable to read file"}",
-                TYPE_ERROR
-            )
-        }
-    }
-
-    private fun stepHistory(delta: Int) {
-        if (commandHistory.isEmpty()) return
-
-        if (historyIndex == -1 && delta < 0) {
-            historyIndex = commandHistory.size - 1
-        } else {
-            historyIndex = (historyIndex + delta)
-                .coerceIn(-1, commandHistory.size - 1)
-        }
-
-        if (historyIndex >= 0) {
-            cmdInput.setText(commandHistory[historyIndex])
-            cmdInput.setSelection(cmdInput.text.length)
-        } else {
-            cmdInput.setText("")
-        }
-    }
-
-    private fun appendLine(text: String, type: Int = TYPE_NORMAL) {
-        if (text.isBlank()) return
-
-        logLines.addLast(LogEntry(text, type))
-        while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
-
-        if (!outputPaused) renderLog()
-    }
-
-    private fun renderLog() {
-        val output = SpannableStringBuilder()
-
-        logLines.forEach { entry ->
-            val color = when (entry.type) {
-                TYPE_SUCCESS -> C_GREEN
-                TYPE_WARNING -> C_AMBER
-                TYPE_ERROR -> C_RED
-                TYPE_INFO -> C_CYAN
-                TYPE_COMMAND -> C_PURPLE
-                else -> C_TEXT
-            }
-
-            if (entry.type == TYPE_COMMAND) {
-                output.appendStyled("[ AIZ3N CORE ] ", C_PURPLE, true)
-                output.appendStyled("::", C_AMBER, true)
-                output.appendStyled(" ${entry.text}", Color.WHITE)
-            } else {
-                output.appendStyled(
-                    entry.text,
-                    color,
-                    entry.type == TYPE_SUCCESS || entry.type == TYPE_ERROR
-                )
-            }
-
-            output.append("\n")
-        }
-
-        logText.text = output
-        logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
-    }
-
-    private fun clearLog() {
-        logLines.clear()
-        logText.text = ""
-    }
-
-    private fun copyLogToClipboard() {
-        val cm = ctx.getSystemService(ClipboardManager::class.java)
-        cm.setPrimaryClip(
-            ClipData.newPlainText(
-                "AIZ3N Console",
-                logLines.joinToString("\n") { it.text }
-            )
-        )
-        Toast.makeText(ctx, "Output copied", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun showOfflineNotice() {
-        if (offlineNoticeShown) return
-        offlineNoticeShown = true
-        appendLine(
-            "Not connected. Launch the game with AIZ3N enabled.",
-            TYPE_WARNING
-        )
-    }
-
-    // Public controls
-
     fun load(commandOrText: String) {
-        val trimmed = commandOrText.trim()
-        if (trimmed.isNotEmpty()) sendCommand(trimmed)
+        console.load(commandOrText)
     }
 
     fun sendCommand(command: String) {
-        val value = command.trim()
-        if (value.isEmpty()) return
-
-        if (!client.isConnected) {
-            showOfflineNotice()
-            return
-        }
-
-        if (commandHistory.lastOrNull() != value) {
-            commandHistory.add(value)
-            if (commandHistory.size > MAX_HISTORY) commandHistory.removeAt(0)
-        }
-
-        historyIndex = -1
-        appendLine(value, TYPE_COMMAND)
-        client.send(value)
+        console.sendCommand(command)
     }
 
     fun minimize() {
         if (isMinimized) return
+
         stopTyping()
         isMinimized = true
         applyWindowLayout()
@@ -735,6 +229,7 @@ class FloatingWindow(
 
     fun restore() {
         if (!isMinimized) return
+
         isMinimized = false
         hideBubble()
         applyWindowLayout()
@@ -749,6 +244,7 @@ class FloatingWindow(
         main.post {
             clampBounds()
             applyWindowLayout()
+
             if (bubbleAdded) {
                 clampBubble()
                 wm.updateViewLayout(bubble, bubbleParams)
@@ -758,21 +254,14 @@ class FloatingWindow(
 
     fun destroy() {
         client.stop()
-        if (fileReceiverRegistered) {
-            try {
-                ctx.unregisterReceiver(filePickerReceiver)
-            } catch (_: Exception) {
-            }
-            fileReceiverRegistered = false
-        }
+        console.destroy()
         hideBubble()
+
         if (rootAdded) {
             wm.removeView(root)
             rootAdded = false
         }
     }
-
-    // Window placement
 
     private fun overlayParams(w: Int, h: Int) = WindowManager.LayoutParams(
         w,
@@ -785,10 +274,12 @@ class FloatingWindow(
         PixelFormat.TRANSLUCENT,
     ).apply {
         gravity = Gravity.TOP or Gravity.START
+
         if (Build.VERSION.SDK_INT >= 28) {
             layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
+
         if (Build.VERSION.SDK_INT >= 30) fitInsetsTypes = 0
     }
 
@@ -913,7 +404,8 @@ class FloatingWindow(
                     applyWindowLayout()
                 }
 
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endInteraction()
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> endInteraction()
             }
 
             return true
@@ -941,6 +433,7 @@ class FloatingWindow(
                         val s = screen()
                         val dx = (e.rawX - downX).roundToInt()
                         val dy = (e.rawY - downY).roundToInt()
+
                         val bottom = (start.bottom + dy).coerceIn(
                             start.top + minHeight,
                             s.height(),
@@ -963,8 +456,8 @@ class FloatingWindow(
                         applyWindowLayout()
                     }
 
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
-                        endInteraction()
+                    MotionEvent.ACTION_UP,
+                    MotionEvent.ACTION_CANCEL -> endInteraction()
                 }
 
                 return true
@@ -1032,11 +525,14 @@ class FloatingWindow(
             0
         } else {
             val covered = insets.getInsets(WindowInsets.Type.ime()).bottom
+
             if (covered > 0) {
                 val frame = IntArray(2)
                 root.getLocationOnScreen(frame)
                 frame[1] + root.height - covered
-            } else keyboardTop
+            } else {
+                keyboardTop
+            }
         }
 
         if (top != keyboardTop) {
@@ -1044,8 +540,6 @@ class FloatingWindow(
             main.post { applyWindowLayout() }
         }
     }
-
-    // Bubble
 
     private fun showBubble() {
         if (bubbleAdded) return
@@ -1171,8 +665,6 @@ class FloatingWindow(
         popup.show()
     }
 
-    // Toolbar and focus
-
     private fun wireToolbar() {
         val mover = moveListener()
         dragHandle.setOnTouchListener(mover)
@@ -1197,7 +689,7 @@ class FloatingWindow(
 
         btnReload.contentDescription = "Reconnect"
         btnReload.setOnClickListener {
-            offlineNoticeShown = false
+            console.setConnectionState(true)
             client.reconnect()
         }
 
@@ -1217,8 +709,6 @@ class FloatingWindow(
         outputPaused = !outputPaused
         prefs.pausedOutput = outputPaused
         updatePauseUi()
-
-        if (!outputPaused) renderLog()
 
         Toast.makeText(
             ctx,
@@ -1290,11 +780,11 @@ class FloatingWindow(
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 MENU_RECONNECT -> {
-                    offlineNoticeShown = false
+                    console.setConnectionState(true)
                     client.reconnect()
                 }
-                MENU_CLEAR -> clearLog()
-                MENU_COPY -> copyLogToClipboard()
+                MENU_CLEAR -> console.clearLog()
+                MENU_COPY -> console.copyLogToClipboard()
                 MENU_OPACITY -> showOpacityPanel()
                 MENU_SETTINGS -> {
                     minimize()
@@ -1384,7 +874,7 @@ class FloatingWindow(
         if (!typing) return
 
         imm.hideSoftInputFromWindow(root.windowToken, 0)
-        if (cmdInput.hasFocus()) root.requestFocus()
+        root.requestFocus()
 
         typing = false
         keyboardTop = 0
@@ -1401,27 +891,6 @@ class FloatingWindow(
         const val MENU_COPY = 3
         const val MENU_OPACITY = 4
         const val MENU_SETTINGS = 5
-
-        const val MAX_LOG_LINES = 500
-        const val MAX_HISTORY = 50
-
-        const val TYPE_NORMAL = 0
-        const val TYPE_SUCCESS = 1
-        const val TYPE_WARNING = 2
-        const val TYPE_ERROR = 3
-        const val TYPE_INFO = 4
-        const val TYPE_COMMAND = 5
-
-        val C_BG = Color.rgb(11, 16, 24)
-        val C_INPUT_BG = Color.rgb(17, 25, 37)
-        val C_DIVIDER = Color.rgb(38, 51, 67)
-        val C_TEXT = Color.rgb(215, 224, 234)
-        val C_MUTED = Color.rgb(105, 121, 140)
-        val C_PURPLE = Color.rgb(192, 132, 252)
         val C_AMBER = Color.rgb(251, 191, 36)
-        val C_GREEN = Color.rgb(85, 214, 162)
-        val C_GREEN_DARK = Color.rgb(23, 107, 80)
-        val C_RED = Color.rgb(255, 107, 107)
-        val C_CYAN = Color.rgb(92, 214, 238)
     }
 }
