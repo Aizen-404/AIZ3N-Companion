@@ -137,6 +137,7 @@ class FloatingWindow(
     private lateinit var logText: TextView
     private lateinit var cmdInput: EditText
     private lateinit var btnSend: TextView
+    private lateinit var btnAttach: TextView
 
     private data class LogEntry(val text: String, val type: Int)
 
@@ -367,6 +368,22 @@ class FloatingWindow(
             }
         }
 
+        btnAttach = TextView(ctx).apply {
+            text = "ATTACH"
+            gravity = Gravity.CENTER
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setTextColor(Color.WHITE)
+            background = roundedBackground(
+                C_INPUT_BG,
+                8,
+                C_PURPLE,
+                1,
+            )
+            setPadding(dp(9), dp(9), dp(9), dp(9))
+            setOnClickListener { openFilePicker() }
+        }
+
         btnSend = TextView(ctx).apply {
             text = "EXECUTE"
             gravity = Gravity.CENTER
@@ -388,6 +405,7 @@ class FloatingWindow(
             cmdInput,
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
         )
+        inputBar.addView(btnAttach)
         inputBar.addView(btnSend)
 
         container.addView(
