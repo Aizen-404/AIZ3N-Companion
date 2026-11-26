@@ -2,9 +2,12 @@
 package com.nnexe.overlaybrowser
 
 import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -12,6 +15,7 @@ import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -42,6 +46,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.provider.OpenableColumns
 import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -112,6 +117,18 @@ class FloatingWindow(
     private var hasConnectedBefore = false
     private var offlineNoticeShown = false
     private var pendingInitialCommand: String? = initialCommand
+    private var fileReceiverRegistered = false
+
+    private val filePickerReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val rawUri = intent.getStringExtra(MainActivity.EXTRA_FILE_URI)
+            if (rawUri.isNullOrBlank()) {
+                appendLine("File selection cancelled.", TYPE_WARNING)
+                return
+            }
+            loadSelectedFile(Uri.parse(rawUri))
+        }
+    }
 
     var isMinimized = false
         private set
@@ -210,6 +227,7 @@ class FloatingWindow(
         updatePauseUi()
         updateLockUi()
         applyWindowLayout()
+        registerFilePickerReceiver()
         wm.addView(root, params)
         rootAdded = true
 
@@ -484,6 +502,12 @@ class FloatingWindow(
         val raw = cmdInput.text.toString().trim()
         if (raw.isEmpty()) return
 
+        if (raw.equals(".load", true)) {
+            cmdInput.setText("")
+            openFilePicker()
+            return
+        }
+
         if (!client.isConnected) {
             showOfflineNotice()
             return
@@ -491,6 +515,79 @@ class FloatingWindow(
 
         cmdInput.setText("")
         sendCommand(raw)
+    }
+
+    private fun registerFilePickerReceiver() {
+        if (fileReceiverRegistered) return
+        val filter = IntentFilter(MainActivity.ACTION_FILE_PICKED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            ctx.registerReceiver(
+                filePickerReceiver,
+                filter,
+                Context.RECEIVER_NOT_EXPORTED
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            ctx.registerReceiver(filePickerReceiver, filter)
+        }
+        fileReceiverRegistered = true
+    }
+
+    private fun openFilePicker() {
+        stopTyping()
+        try {
+            ctx.startActivity(
+                Intent(ctx, MainActivity::class.java)
+                    .setAction(MainActivity.ACTION_PICK_FILE)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (e: Exception) {
+            appendLine(
+                "Unable to open file picker: ${e.message ?: "unknown error"}",
+                TYPE_ERROR
+            )
+        }
+    }
+
+    private fun loadSelectedFile(uri: Uri) {
+        if (!client.isConnected) {
+            showOfflineNotice()
+            return
+        }
+
+        try {
+            var fileName = "selected file"
+            ctx.contentResolver.query(
+                uri,
+                arrayOf(OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index >= 0) fileName = cursor.getString(index) ?: fileName
+                }
+            }
+
+            val lowerName = fileName.lowercase()
+            if (!lowerName.endsWith(".ts") && !lowerName.endsWith(".js")) {
+                appendLine("Only .ts and .js files are supported.", TYPE_ERROR)
+                return
+            }
+
+            val contents = ctx.contentResolver.openInputStream(uri)?.use {
+                it.readBytes()
+            } ?: throw IllegalStateException("Unable to read selected file")
+
+            appendLine("Loading $fileName...", TYPE_INFO)
+            client.sendLoadFile(contents)
+        } catch (e: Exception) {
+            appendLine(
+                "File load failed: ${e.message ?: "unable to read file"}",
+                TYPE_ERROR
+            )
+        }
     }
 
     private fun stepHistory(delta: Int) {
@@ -637,6 +734,13 @@ class FloatingWindow(
 
     fun destroy() {
         client.stop()
+        if (fileReceiverRegistered) {
+            try {
+                ctx.unregisterReceiver(filePickerReceiver)
+            } catch (_: Exception) {
+            }
+            fileReceiverRegistered = false
+        }
         hideBubble()
         if (rootAdded) {
             wm.removeView(root)

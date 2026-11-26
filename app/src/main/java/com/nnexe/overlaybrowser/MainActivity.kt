@@ -30,6 +30,7 @@ class MainActivity : Activity() {
     private lateinit var btnPermStorage: Button
     private lateinit var targetEndpoint: EditText
     private var requestingPermission = false
+    private var pickingFile = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -150,11 +151,71 @@ class MainActivity : Activity() {
         ).forEach { id ->
             findViewById<View?>(id)?.visibility = View.GONE
         }
+
+        handlePickerIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handlePickerIntent(intent)
+    }
+
+    private fun handlePickerIntent(source: Intent?) {
+        if (source?.action != ACTION_PICK_FILE) return
+        requestingPermission = true
+        pickingFile = true
+        try {
+            val picker = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(
+                    Intent.EXTRA_MIME_TYPES,
+                    arrayOf("text/javascript", "application/javascript", "text/plain")
+                )
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            }
+            startActivityForResult(picker, REQ_FILE)
+        } catch (_: Exception) {
+            requestingPermission = false
+            pickingFile = false
+            sendPickedFile(null)
+            finishAndRemoveTask()
+        }
+    }
+
+    @Deprecated("Deprecated in Android")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_FILE) return
+        val uri = if (resultCode == RESULT_OK) data?.data else null
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+        }
+        sendPickedFile(uri)
+        requestingPermission = false
+        pickingFile = false
+        finishAndRemoveTask()
+    }
+
+    private fun sendPickedFile(uri: Uri?) {
+        sendBroadcast(
+            Intent(ACTION_FILE_PICKED)
+                .setPackage(packageName)
+                .putExtra(EXTRA_FILE_URI, uri?.toString())
+        )
     }
 
     override fun onResume() {
         super.onResume()
-        requestingPermission = false
+        if (!pickingFile) requestingPermission = false
         refresh()
     }
 
@@ -300,8 +361,12 @@ class MainActivity : Activity() {
             if (storageOk) View.GONE else View.VISIBLE
     }
 
-    private companion object {
-        const val REQ_NOTIF = 1
-        const val REQ_STORAGE = 2
+    companion object {
+        const val ACTION_PICK_FILE = "com.nnexe.overlaybrowser.PICK_AGENT_FILE"
+        const val ACTION_FILE_PICKED = "com.nnexe.overlaybrowser.AGENT_FILE_PICKED"
+        const val EXTRA_FILE_URI = "agent_file_uri"
+        private const val REQ_NOTIF = 1
+        private const val REQ_STORAGE = 2
+        private const val REQ_FILE = 3
     }
 }
