@@ -1,11 +1,10 @@
 
-name: Build AIZ3N APK
+name: AIZ3N Companion Build
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,11 +23,15 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
       - name: Build Debug APK
         run: ./gradlew assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AIZ3N-Debug-APK
+          name: AIZ3N-Companion-APK
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
