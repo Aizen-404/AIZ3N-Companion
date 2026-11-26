@@ -282,7 +282,7 @@ class FloatingWindow(
             setSingleLine(true)
             imeOptions = EditorInfo.IME_ACTION_SEND or EditorInfo.IME_FLAG_NO_EXTRACT_UI
             setPadding(dp(3), dp(7), dp(5), dp(7))
-            isSelectAllOnFocus = false
+            
 
             setOnTouchListener { _, e ->
                 if (e.actionMasked == MotionEvent.ACTION_DOWN) {
