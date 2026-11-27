@@ -28,11 +28,7 @@
     </path>
 
     <!-- Subtle Ambient Grid / Tech Lines in Background -->
-    <path
-        android:fillAlpha="0.10"
-        android:pathData="M18,22 L90,22 M18,54 L90,54 M18,86 L90,86 M36,16 L36,92 M72,16 L72,92"
-        android:strokeColor="#B84DFF"
-        android:strokeWidth="0.45" />
+   
 
     <!-- Under-Wordmark Neon Bloom -->
     <path
